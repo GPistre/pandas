@@ -63,7 +63,7 @@ class _Window(PandasObject, SelectionMixin):
     exclusions = set()
 
     def __init__(self, obj, window=None, min_periods=None,
-                 center=False, win_type=None, axis=0, on=None, closed=None,
+                 center=False, forward=False, win_type=None, axis=0, on=None, closed=None,
                  **kwargs):
 
         self.__dict__.update(kwargs)
@@ -74,6 +74,7 @@ class _Window(PandasObject, SelectionMixin):
         self.window = window
         self.min_periods = min_periods
         self.center = center
+        self.forward = forward
         self.win_type = win_type
         self.win_freq = None
         self.axis = obj._get_axis_number(axis) if axis is not None else None
@@ -98,6 +99,8 @@ class _Window(PandasObject, SelectionMixin):
     def validate(self):
         if self.center is not None and not is_bool(self.center):
             raise ValueError("center must be a boolean")
+        if self.forward is not None and not is_bool(self.forward):
+            raise ValueError("forward must be a boolean")
         if self.min_periods is not None and not \
            is_integer(self.min_periods):
             raise ValueError("min_periods must be an integer")
@@ -305,7 +308,23 @@ class _Window(PandasObject, SelectionMixin):
             raise ValueError("Requested axis is larger then no. of argument "
                              "dimensions")
 
-        offset = _offset(window, True)
+        offset = _offset(window, True, False)
+        if offset > 0:
+            if isinstance(result, (ABCSeries, ABCDataFrame)):
+                result = result.slice_shift(-offset, axis=self.axis)
+            else:
+                lead_indexer = [slice(None)] * result.ndim
+                lead_indexer[self.axis] = slice(offset, None)
+                result = np.copy(result[tuple(lead_indexer)])
+        return result
+
+    def _adjust_window(self, result, window):
+        """ adjust the result in the window """
+        if self.axis > result.ndim - 1:
+            raise ValueError("Requested axis is larger then no. of argument "
+                             "dimensions")
+
+        offset = _offset(window, self.center, self.forward)
         if offset > 0:
             if isinstance(result, (ABCSeries, ABCDataFrame)):
                 result = result.slice_shift(-offset, axis=self.axis)
@@ -465,6 +484,8 @@ class Window(_Window):
         this will default to 1.
     center : boolean, default False
         Set the labels at the center of the window.
+    forward : boolean, default False
+        Set the labels at the forward of the window.
     win_type : string, default None
         Provide a window type. If ``None``, all points are evenly weighted.
         See the notes below for further information.
@@ -563,7 +584,8 @@ class Window(_Window):
     Notes
     -----
     By default, the result is set to the right edge of the window. This can be
-    changed to the center of the window by setting ``center=True``.
+    changed to the center of the window by setting ``center=True`` or ``forward=True`` for the left edge
+    of the window.
 
     To learn more about the offsets & frequency strings, please see `this link
     <http://pandas.pydata.org/pandas-docs/stable/timeseries.html#offset-aliases>`__.
@@ -670,6 +692,7 @@ class Window(_Window):
         """
         window = self._prep_window(**kwargs)
         center = self.center
+        forward = self.forward
 
         blocks, obj, index = self._create_blocks()
         results = []
@@ -684,20 +707,19 @@ class Window(_Window):
                 results.append(values.copy())
                 continue
 
-            offset = _offset(window, center)
+            offset = _offset(window, center, forward)
             additional_nans = np.array([np.NaN] * offset)
 
             def f(arg, *args, **kwargs):
                 minp = _use_window(self.min_periods, len(window))
-                return _window.roll_window(np.concatenate((arg,
-                                                           additional_nans))
-                                           if center else arg, window, minp,
-                                           avg=mean)
+                win = np.concatenate((arg, additional_nans)) if center or forward else arg
+                return _window.roll_window(win, window, minp, avg=mean)
 
             result = np.apply_along_axis(f, self.axis, values)
 
-            if center:
-                result = self._center_window(result, window)
+            if center or forward:
+                # result = self._center_window(result, window)
+                result = self._adjust_window(result, window)
             results.append(result)
 
         return self._wrap_results(results, blocks, obj)
@@ -786,7 +808,7 @@ class _GroupByMixin(GroupByMixin):
     corr = GroupByMixin._dispatch('corr', other=None, pairwise=None)
     cov = GroupByMixin._dispatch('cov', other=None, pairwise=None)
 
-    def _apply(self, func, name, window=None, center=None,
+    def _apply(self, func, name, window=None, center=None, forward=None,
                check_minp=None, **kwargs):
         """
         dispatch to apply; we are stripping all of the _apply kwargs and
@@ -810,7 +832,7 @@ class _Rolling(_Window):
     def _constructor(self):
         return Rolling
 
-    def _apply(self, func, name=None, window=None, center=None,
+    def _apply(self, func, name=None, window=None, center=None, forward=None,
                check_minp=None, **kwargs):
         """
         Rolling statistical measure using supplied function. Designed to be
@@ -831,6 +853,8 @@ class _Rolling(_Window):
         """
         if center is None:
             center = self.center
+        if forward is None:
+            forward = self.forward
         if window is None:
             window = self._get_window()
 
@@ -839,6 +863,9 @@ class _Rolling(_Window):
 
         blocks, obj, index = self._create_blocks()
         index, indexi = self._get_index(index=index)
+
+        # time_gcd = reduce(math.gcd, indexi + [window])
+
         results = []
         for b in blocks:
             values = self._prep_values(b.values)
@@ -858,18 +885,18 @@ class _Rolling(_Window):
                     minp = check_minp(min_periods, window)
                     # ensure we are only rolling on floats
                     arg = ensure_float64(arg)
-                    return cfunc(arg,
-                                 window, minp, indexi, closed, **kwargs)
+                    return cfunc(arg, window, minp, indexi, closed, **kwargs)
 
             # calculation function
-            if center:
-                offset = _offset(window, center)
+            if center or forward:
+                offset = _offset(window, center, forward)
                 additional_nans = np.array([np.NaN] * offset)
 
                 def calc(x):
                     return func(np.concatenate((x, additional_nans)),
                                 window, min_periods=self.min_periods,
                                 closed=self.closed)
+
             else:
 
                 def calc(x):
@@ -882,8 +909,8 @@ class _Rolling(_Window):
                 else:
                     result = calc(values)
 
-            if center:
-                result = self._center_window(result, window)
+            if center or forward:
+                result = self._adjust_window(result, window)
 
             results.append(result)
 
@@ -942,7 +969,7 @@ class _Rolling_and_Expanding(_Rolling):
         for b in blocks:
             result = b.notna().astype(int)
             result = self._constructor(result, window=window, min_periods=0,
-                                       center=self.center,
+                                       center=self.center, forward=self.forward,
                                        closed=self.closed).sum()
             results.append(result)
 
@@ -977,7 +1004,7 @@ class _Rolling_and_Expanding(_Rolling):
         # TODO: _level is unused?
         _level = kwargs.pop('_level', None)  # noqa
         window = self._get_window()
-        offset = _offset(window, self.center)
+        offset = _offset(window, self.center, self.forward)
         index, indexi = self._get_index()
 
         # TODO: default is for backward compat
@@ -1000,7 +1027,7 @@ class _Rolling_and_Expanding(_Rolling):
                 closed, offset, func, raw, args, kwargs)
 
         return self._apply(f, func, args=args, kwargs=kwargs,
-                           center=False, raw=raw)
+                           center=False, forward=False, raw=raw)
 
     def sum(self, *args, **kwargs):
         nv.validate_window_func('sum', args, kwargs)
@@ -1381,9 +1408,9 @@ class _Rolling_and_Expanding(_Rolling):
             X = X.astype('float64')
             Y = Y.astype('float64')
             mean = lambda x: x.rolling(window, self.min_periods,
-                                       center=self.center).mean(**kwargs)
+                                       center=self.center, forward=self.forward).mean(**kwargs)
             count = (X + Y).rolling(window=window,
-                                    center=self.center).count(**kwargs)
+                                    center=self.center, forward=self.forward).count(**kwargs)
             bias_adj = count / (count - ddof)
             return (mean(X * Y) - mean(X) * mean(Y)) * bias_adj
 
@@ -1509,9 +1536,9 @@ class _Rolling_and_Expanding(_Rolling):
 
         def _get_corr(a, b):
             a = a.rolling(window=window, min_periods=self.min_periods,
-                          center=self.center)
+                          center=self.center, forward=self.forward)
             b = b.rolling(window=window, min_periods=self.min_periods,
-                          center=self.center)
+                          center=self.center, forward=self.forward)
 
             return a.cov(b, **kwargs) / (a.std(**kwargs) * b.std(**kwargs))
 
@@ -1546,6 +1573,10 @@ class Rolling(_Rolling_and_Expanding):
         super(Rolling, self).validate()
 
         # we allow rolling on a datetimelike index
+
+        if self.center and self.forward:
+            raise ValueError('Only one of center or forward should be set to ``True``')
+
         if ((self.obj.empty or self.is_datetimelike) and
                 isinstance(self.window, (compat.string_types, ABCDateOffset,
                                          timedelta))):
@@ -1554,10 +1585,10 @@ class Rolling(_Rolling_and_Expanding):
             freq = self._validate_freq()
 
             # we don't allow center
-            if self.center:
-                raise NotImplementedError("center is not implemented "
-                                          "for datetimelike and offset "
-                                          "based windows")
+            # if self.center or self.forward:
+            #     raise NotImplementedError("center is not implemented "
+            #                               "for datetimelike and offset "
+            #                               "based windows")
 
             # this will raise ValueError on non-fixed freqs
             self.win_freq = self.window
@@ -1854,10 +1885,10 @@ class Expanding(_Rolling_and_Expanding):
 
     _attributes = ['min_periods', 'center', 'axis']
 
-    def __init__(self, obj, min_periods=1, center=False, axis=0,
+    def __init__(self, obj, min_periods=1, center=False, forward=False, axis=0,
                  **kwargs):
         super(Expanding, self).__init__(obj=obj, min_periods=min_periods,
-                                        center=center, axis=axis)
+                                        center=center, forward=forward, axis=axis)
 
     @property
     def _constructor(self):
@@ -2495,10 +2526,17 @@ def _get_center_of_mass(comass, span, halflife, alpha):
     return float(comass)
 
 
-def _offset(window, center):
+def _offset(window, center, forward):
     if not is_integer(window):
         window = len(window)
-    offset = (window - 1) / 2. if center else 0
+
+    if center:
+        offset = (window - 1) / 2.
+    elif forward:
+        offset = (window - 1)
+    else:
+        offset = 0
+
     try:
         return int(offset)
     except:

@@ -9067,12 +9067,12 @@ class NDFrame(PandasObject, SelectionMixin):
         from pandas.core import window as rwindow
 
         @Appender(rwindow.rolling.__doc__)
-        def rolling(self, window, min_periods=None, center=False,
+        def rolling(self, window, min_periods=None, center=False, forward=False,
                     win_type=None, on=None, axis=0, closed=None):
             axis = self._get_axis_number(axis)
             return rwindow.rolling(self, window=window,
                                    min_periods=min_periods,
-                                   center=center, win_type=win_type,
+                                   center=center, forward=forward, win_type=win_type,
                                    on=on, axis=axis, closed=closed)
 
         cls.rolling = rolling
